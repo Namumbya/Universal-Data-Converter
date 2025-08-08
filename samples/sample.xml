@@ -1,0 +1,6 @@
+<root>
+  <items>
+    <item><id>1</id><name>Alice</name><amount>10.5</amount></item>
+    <item><id>2</id><name>Bob</name><amount>9.0</amount></item>
+  </items>
+</root>
