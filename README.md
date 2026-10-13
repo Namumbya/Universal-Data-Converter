@@ -6,7 +6,7 @@ Upload a file, preview it, and download CSV, Excel, JSON, XML, Markdown, or PDF.
 
 ## Run
 
-Requires [uv](https://docs.astral.sh/uv/) and Python 3.14 or newer.
+Requires [uv](https://docs.astral.sh/uv/) and Python 3.12 or newer.
 
 ```bash
 uv sync
