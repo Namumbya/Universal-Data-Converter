@@ -28,7 +28,9 @@ On Streamlit Community Cloud, set the main file to `app.py`. Cloud installs the 
 
 ## Notes
 
-- PDF table extraction is best-effort and does not read scanned pages. At most 25 pages are scanned.
+- PDF table extraction is best-effort and does not read scanned pages. At most 25 pages are scanned. Pages with no table are kept as text. A PDF download keeps the first 2,000 rows of each table.
+- CSV and Excel cells that look like formulas (`=`, `+`, `@`, or a minus sign that is not a number) are prefixed with `'` so the spreadsheet does not run them.
+- Word and Excel files that would expand past 200 MB are refused.
 - A workbook downloaded as CSV is a zip with one CSV per sheet. Markdown keeps every sheet in one file.
 - Markdown input must be a pipe table (`| column |` and a `| --- |` row).
-- Output formats include Markdown (.md), PDF (.pdf), and Word (.docx). Word to PDF keeps the document text and tables. PDF to Word keeps the extracted tables.
+- Output formats include Markdown (.md), PDF (.pdf), and Word (.docx). Word to PDF previews and downloads the document itself, including headings, lists, and characters such as dashes. PDF to Word keeps the extracted tables. A PDF that mixes tables and prose keeps both: the tables, and the text from pages that have none.

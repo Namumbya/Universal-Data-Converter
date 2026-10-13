@@ -6,6 +6,7 @@ from converter import (
     MAX_UPLOAD_BYTES,
     SUPPORTED_INPUTS,
     SUPPORTED_OUTPUTS,
+    docx_preview_text,
     docx_to_pdf,
     export_tables,
     load_tables,
@@ -21,6 +22,24 @@ SAMPLES = {
     "PDF": ROOT / "samples" / "sample.pdf",
 }
 PREVIEW_ROWS = 100
+
+
+@st.cache_data(show_spinner=False, max_entries=4, ttl=600)
+def cached_load(raw: bytes, suffix: str):
+    return load_tables(raw, suffix)
+
+
+@st.cache_data(show_spinner=False, max_entries=4, ttl=600)
+def cached_export(raw: bytes, suffix: str, out_fmt: str):
+    if suffix == ".docx" and out_fmt.lower().startswith("pdf"):
+        return docx_to_pdf(raw)
+    tables, _warnings = cached_load(raw, suffix)
+    return export_tables(tables, out_fmt)
+
+
+@st.cache_data(show_spinner=False, max_entries=4, ttl=600)
+def cached_docx_preview(raw: bytes) -> str:
+    return docx_preview_text(raw)
 
 
 class NamedUpload:
@@ -81,7 +100,7 @@ for index, upload in enumerate(sources):
 
     raw = upload.getvalue() if hasattr(upload, "getvalue") else upload.read()
     try:
-        tables, warnings = load_tables(raw, suffix)
+        tables, warnings = cached_load(raw, suffix)
     except Exception as exc:
         st.error(f"Could not read {upload.name}: {exc}")
         continue
@@ -89,20 +108,28 @@ for index, upload in enumerate(sources):
     for warning in warnings:
         st.warning(warning)
 
+    preview_document = suffix == ".docx" and out_fmt.lower().startswith("pdf")
     with st.expander(f"Preview — {upload.name}", expanded=True):
-        for table in tables:
-            rows, cols = table.frame.shape
-            label = table.name if len(tables) > 1 else "Data"
-            st.write(f"{label}: {rows} rows × {cols} columns")
-            if rows > PREVIEW_ROWS:
-                st.caption(f"Showing the first {PREVIEW_ROWS} of {rows} rows.")
-            st.dataframe(table.frame.head(PREVIEW_ROWS), width="stretch")
+        if preview_document:
+            st.caption("Preview of the document that will be downloaded as a PDF.")
+            st.text_area(
+                "Document",
+                value=cached_docx_preview(raw),
+                height=420,
+                disabled=True,
+                label_visibility="collapsed",
+            )
+        else:
+            for table in tables:
+                rows, cols = table.frame.shape
+                label = table.name if len(tables) > 1 else "Data"
+                st.write(f"{label}: {rows} rows × {cols} columns")
+                if rows > PREVIEW_ROWS:
+                    st.caption(f"Showing the first {PREVIEW_ROWS} of {rows} rows.")
+                st.dataframe(table.frame.head(PREVIEW_ROWS), width="stretch")
 
     try:
-        if suffix == ".docx" and out_fmt.lower().startswith("pdf"):
-            exported = docx_to_pdf(raw)
-        else:
-            exported = export_tables(tables, out_fmt)
+        exported = cached_export(raw, suffix, out_fmt)
     except Exception as exc:
         st.error(f"Could not convert {upload.name}: {exc}")
         continue

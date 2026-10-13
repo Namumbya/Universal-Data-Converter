@@ -1,6 +1,7 @@
 # Direct dependencies only. Streamlit Cloud installs this file;
 # do not replace it with the output of pip freeze.
-streamlit>=1.39,<2
+# width="stretch" exists from 1.48. 1.50 keeps older installs from raising TypeError.
+streamlit>=1.50,<2
 pandas>=2.2,<4
 openpyxl>=3.1.2
 xlrd>=2.0.1

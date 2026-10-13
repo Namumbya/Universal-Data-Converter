@@ -11,16 +11,13 @@ import json
 import re
 import zipfile
 from dataclasses import dataclass
+from pathlib import Path
 from xml.etree import ElementTree as ET
 
 import pandas as pd
+import pdfplumber
 from defusedxml.ElementTree import parse as parse_xml
 from defusedxml.common import DefusedXmlException
-
-try:
-    import pdfplumber
-except ImportError:  # pragma: no cover - exercised when the extra is absent
-    pdfplumber = None
 
 SUPPORTED_INPUTS = [".csv", ".xlsx", ".xls", ".json", ".xml", ".pdf", ".md", ".docx"]
 SUPPORTED_OUTPUTS = [
@@ -35,6 +32,8 @@ SUPPORTED_OUTPUTS = [
 
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 MAX_PDF_PAGES = 25
+MAX_PDF_ROWS = 2000
+MAX_UNPACKED_BYTES = 200 * 1024 * 1024
 _SNIFF_BYTES = 64 * 1024
 
 
@@ -61,8 +60,12 @@ def load_tables(source, suffix: str) -> tuple[list[Table], list[str]]:
     data = _read_bytes(source)
     if not data:
         raise ValueError("The file is empty.")
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise ValueError("The file is larger than 50 MB.")
 
     kind = _normalize_suffix(suffix)
+    if kind == ".xlsx":
+        _check_unpacked_size(data)
     warnings: list[str] = []
     if kind == ".csv":
         tables = [_csv_table(data, warnings)]
@@ -117,6 +120,17 @@ def _read_bytes(source) -> bytes:
     if isinstance(data, str):
         return data.encode("utf-8")
     return bytes(data)
+
+
+def _check_unpacked_size(data: bytes) -> None:
+    """Reject zip-based files that expand far beyond the upload limit."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            total = sum(info.file_size for info in archive.infolist())
+    except zipfile.BadZipFile:
+        return  # the format reader reports a friendlier error
+    if total > MAX_UNPACKED_BYTES:
+        raise ValueError("The file expands to more than 200 MB and was not opened.")
 
 
 def _normalize_suffix(suffix: str) -> str:
@@ -367,29 +381,45 @@ def _flat_xml_frame(root: ET.Element) -> pd.DataFrame:
 
 
 def _pdf_tables(data: bytes, warnings: list[str]) -> list[Table]:
-    if pdfplumber is None:
-        warnings.append("PDF support requires pdfplumber. Returning a short text snippet instead.")
-        snippet = data[:2000].decode("latin-1", errors="ignore")
-        return [Table("Text", pd.DataFrame({"text": [snippet]}))]
-
     tables: list[Table] = []
-    with pdfplumber.open(io.BytesIO(data)) as pdf:
+    try:
+        pdf = pdfplumber.open(io.BytesIO(data))
+    except Exception as exc:
+        raise ValueError(f"Could not read the PDF file: {exc}") from exc
+    with pdf:
         page_count = len(pdf.pages)
         pages = pdf.pages[:MAX_PDF_PAGES]
         if page_count > MAX_PDF_PAGES:
             warnings.append(f"Scanned the first {MAX_PDF_PAGES} of {page_count} pages.")
-        for page_number, page in enumerate(pages, start=1):
-            extracted = page.extract_tables() or []
-            found = 0
-            for grid in extracted:
-                frame = _grid_to_frame(grid)
-                if frame is None:
-                    continue
-                found += 1
-                tables.append(Table(f"Page{page_number}_Table{found}", frame))
+        without_tables: list[int] = []
+        try:
+            for page_number, page in enumerate(pages, start=1):
+                found = 0
+                for grid in page.extract_tables() or []:
+                    frame = _grid_to_frame(grid)
+                    if frame is None:
+                        continue
+                    found += 1
+                    tables.append(Table(f"Page{page_number}_Table{found}", frame))
+                if not found:
+                    without_tables.append(page_number)
+        except Exception as exc:
+            raise ValueError(f"Could not read the PDF file: {exc}") from exc
         if tables:
-            return tables
-        texts = [(page.extract_text() or "") for page in pages[: min(3, len(pages))]]
+            text_tables = []
+            text_pages: list[int] = []
+            for page_number in without_tables:
+                text = (pages[page_number - 1].extract_text() or "").strip()
+                if not text:
+                    continue
+                text_pages.append(page_number)
+                text_tables.append(Table(f"Page{page_number}_Text", pd.DataFrame({"text": [text]})))
+            if text_pages:
+                numbers = ", ".join(str(number) for number in text_pages[:10])
+                more = "..." if len(text_pages) > 10 else ""
+                warnings.append(f"Pages without a table were exported as text: {numbers}{more}.")
+            return tables + text_tables
+        texts = [(page.extract_text() or "") for page in pages]
     warnings.append("No tables were found in the PDF. Exported page text instead.")
     return [Table("Text", pd.DataFrame({"text": texts or [""]}))]
 
@@ -445,6 +475,13 @@ def _markdown_tables(data: bytes) -> list[Table]:
     index = 0
     while index < len(lines):
         stripped = lines[index].strip()
+        if stripped.startswith(("```", "~~~")):
+            fence = stripped[:3]
+            index += 1
+            while index < len(lines) and not lines[index].strip().startswith(fence):
+                index += 1
+            index += 1
+            continue
         if stripped.startswith("#"):
             heading = stripped.lstrip("#").strip() or "Data"
             index += 1
@@ -544,97 +581,192 @@ def _markdown_cell(value) -> str:
     return text.replace("\r\n", " ").replace("\n", " ").strip()
 
 
+_HEADING_SIZE = {"title": 20, "heading1": 16, "heading2": 14, "heading3": 13}
+
+
+def docx_preview_text(data: bytes) -> str:
+    """Readable text of a Word file, in the same order the PDF uses."""
+    lines = []
+    for kind, payload, *rest in _docx_blocks(data):
+        if kind == "paragraph":
+            text = (payload or "").strip()
+            if not text:
+                continue
+            role = rest[0] if rest else "body"
+            lines.append(_as_bullet(text) if role == "list" else text)
+            continue
+        for row in _document_rows(payload):
+            if len(row) <= 1:
+                lines.append(row[0])
+            else:
+                lines.append(" | ".join(row))
+    if not lines:
+        raise ValueError("The Word file has no text or tables to convert.")
+    return "\n\n".join(lines)
+
+
 def docx_to_pdf(data: bytes) -> Export:
-    """Turn a Word document into a PDF of its text and tables."""
+    """Turn a Word document into a PDF of its headings, lists, and tables."""
     pdf, family, has_bold, unicode_font = _new_pdf()
     wrote = False
-    for block in _docx_blocks(data):
-        if block[0] == "paragraph":
-            text = block[1].strip()
-            if not text:
-                pdf.ln(3)
-                continue
-            if block[2]:
-                pdf.set_font(family, "B" if has_bold else "", 16)
-                pdf.multi_cell(0, 8, _pdf_text(text, unicode_font))
-                pdf.ln(2)
-            else:
-                pdf.set_font(family, size=12)
-                pdf.multi_cell(0, 7, _pdf_text(text, unicode_font))
-                pdf.ln(1)
-            wrote = True
-        else:
-            _write_pdf_table(pdf, block[1], family, unicode_font)
-            pdf.ln(4)
+    for kind, payload, *rest in _docx_blocks(data):
+        if kind == "paragraph":
+            role = rest[0] if rest else "body"
+            wrote = _write_pdf_paragraph(pdf, payload, role, family, has_bold, unicode_font) or wrote
+        elif _write_pdf_docx_table(pdf, payload, family, has_bold, unicode_font):
             wrote = True
     if not wrote:
         raise ValueError("The Word file has no text or tables to convert.")
     return Export(data=_pdf_bytes(pdf), mime="application/pdf", extension="pdf")
 
 
+def _write_pdf_paragraph(pdf, text: str, role: str, family: str, has_bold: bool, unicode_font: bool) -> bool:
+    text = (text or "").strip()
+    if not text:
+        pdf.ln(2)
+        return False
+    if role in _HEADING_SIZE:
+        pdf.set_font(family, "B" if has_bold else "", _HEADING_SIZE[role])
+        pdf.multi_cell(0, 8, _pdf_text(text, unicode_font))
+        pdf.ln(1)
+        return True
+    if role == "list":
+        text = _as_bullet(text)
+    pdf.set_font(family, size=11)
+    pdf.multi_cell(0, 6, _pdf_text(text, unicode_font))
+    pdf.ln(0.5)
+    return True
+
+
+def _as_bullet(text: str) -> str:
+    stripped = text.lstrip()
+    if stripped.startswith(("•", "-", "*", "–", "—")):
+        return stripped
+    return f"• {stripped}"
+
+
+def _write_pdf_docx_table(pdf, rows: list[list[str]], family: str, has_bold: bool, unicode_font: bool) -> bool:
+    rows = _document_rows(rows)
+    if not rows:
+        return False
+    if all(len(row) <= 1 for row in rows):
+        for index, row in enumerate(rows):
+            role = "heading3" if index == 0 else "body"
+            _write_pdf_paragraph(pdf, row[0], role, family, has_bold, unicode_font)
+        pdf.ln(1)
+        return True
+    _write_pdf_table(pdf, rows, family, unicode_font)
+    pdf.ln(3)
+    return True
+
+
+def _document_rows(rows: list[list[str]]) -> list[list[str]]:
+    cleaned = []
+    for row in rows:
+        cells = [cell.strip() for cell in row]
+        if any(cells):
+            cleaned.append(cells)
+    width = max((len(row) for row in cleaned), default=0)
+    if width > 1:
+        cleaned = [row + [""] * (width - len(row)) for row in cleaned]
+    return cleaned
+
+
 def _docx_tables(data: bytes, warnings: list[str]) -> list[Table]:
+    blocks = _docx_blocks(data)
     tables = []
-    for name, rows in _docx_table_rows(data):
-        if not rows:
+    number = 0
+    for kind, payload, *_rest in blocks:
+        if kind != "table":
             continue
-        columns = _dedupe_headers(rows[0])
-        body = [_pad(row, len(columns)) for row in rows[1:]]
-        tables.append(Table(name, pd.DataFrame(body, columns=columns)))
+        number += 1
+        if not payload:
+            continue
+        columns = _dedupe_headers(payload[0])
+        body = [_pad(row, len(columns)) for row in payload[1:]]
+        tables.append(Table(f"Table{number}", pd.DataFrame(body, columns=columns)))
     if tables:
         return tables
-    lines = [text for _kind, text, _heading in _docx_blocks(data) if _kind == "paragraph" and text.strip()]
+    lines = [block[1] for block in blocks if block[0] == "paragraph" and block[1].strip()]
     if not lines:
         raise ValueError("The Word file has no text or tables.")
     warnings.append("No tables were found in the Word file. Preview shows the document text.")
     return [Table("Text", pd.DataFrame({"text": [line.strip() for line in lines]}))]
 
 
-def _docx_blocks(data: bytes):
+def _docx_blocks(data: bytes) -> list[tuple]:
     from docx import Document
     from docx.oxml.table import CT_Tbl
     from docx.oxml.text.paragraph import CT_P
     from docx.table import Table as DocxTable
     from docx.text.paragraph import Paragraph
 
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise ValueError("The file is larger than 50 MB.")
+    _check_unpacked_size(data)
     try:
         document = Document(io.BytesIO(data))
     except Exception as exc:
         raise ValueError(f"Could not read the Word file: {exc}") from exc
+    blocks: list[tuple] = []
     for child in document.element.body.iterchildren():
         if isinstance(child, CT_P):
             paragraph = Paragraph(child, document)
-            style = ""
-            if paragraph.style is not None and paragraph.style.name:
-                style = paragraph.style.name
-            yield ("paragraph", paragraph.text or "", style.startswith("Heading"))
+            blocks.append(("paragraph", paragraph.text or "", _paragraph_role(paragraph)))
         elif isinstance(child, CT_Tbl):
-            yield ("table", _docx_rows(DocxTable(child, document)))
+            blocks.append(("table", _docx_rows(DocxTable(child, document))))
+    return blocks
 
 
-def _docx_table_rows(data: bytes):
-    index = 0
-    for kind, payload, *_rest in _docx_blocks(data):
-        if kind != "table":
-            continue
-        index += 1
-        yield f"Table{index}", payload
+def _paragraph_role(paragraph) -> str:
+    style = ""
+    if paragraph.style is not None and paragraph.style.name:
+        style = paragraph.style.name
+    compact = style.replace(" ", "").lower()
+    if compact == "title":
+        return "title"
+    if compact.startswith("heading"):
+        digits = "".join(character for character in compact if character.isdigit()) or "1"
+        return f"heading{digits}"
+    properties = paragraph._p.pPr
+    if properties is not None and properties.numPr is not None:
+        return "list"
+    if compact.startswith("list"):
+        return "list"
+    return "body"
 
 
 def _docx_rows(table) -> list[list[str]]:
-    return [[cell.text.strip() for cell in row.cells] for row in table.rows]
+    seen: set = set()
+    rows = []
+    for row in table.rows:
+        values = []
+        for cell in row.cells:
+            # Merged cells come back once per grid position; keep the text once.
+            key = cell._tc
+            values.append("" if key in seen else cell.text.strip())
+            seen.add(key)
+        rows.append(values)
+    return rows
 
 
 def _export_pdf(tables: list[Table]) -> Export:
     pdf, family, _has_bold, unicode_font = _new_pdf()
     several = len(tables) > 1
+    capped = False
     for index, table in enumerate(tables, start=1):
         if several:
             pdf.set_font(family, size=14)
             pdf.multi_cell(0, 8, _pdf_text(table.name or f"Sheet {index}", unicode_font))
             pdf.ln(2)
-        _write_pdf_table(pdf, _frame_rows(table.frame), family, unicode_font)
+        frame = table.frame
+        if len(frame) > MAX_PDF_ROWS:
+            frame = frame.head(MAX_PDF_ROWS)
+            capped = True
+        _write_pdf_table(pdf, _frame_rows(frame), family, unicode_font)
         pdf.ln(4)
-    return Export(data=_pdf_bytes(pdf), mime="application/pdf", extension="pdf")
+    note = f"PDF output is limited to the first {MAX_PDF_ROWS} rows of each table." if capped else ""
+    return Export(data=_pdf_bytes(pdf), mime="application/pdf", extension="pdf", note=note)
 
 
 def _export_docx(tables: list[Table]) -> Export:
@@ -683,7 +815,7 @@ def _write_pdf_table(pdf, rows: list[list[str]], family: str, unicode_font: bool
     if not rows or not rows[0]:
         return
     pdf.set_font(family, size=10)
-    with pdf.table(width=pdf.epw) as pdf_table:
+    with pdf.table(width=pdf.epw, repeat_headings=0, text_align="LEFT") as pdf_table:
         for row in rows:
             pdf_row = pdf_table.row()
             width = len(rows[0])
@@ -717,9 +849,9 @@ def _register_pdf_font(pdf) -> tuple[str, bool, bool]:
 
 
 def _pdf_font_files() -> tuple[Path | None, Path | None]:
-    from pathlib import Path
-
+    bundled = Path(__file__).resolve().parent / "fonts"
     candidates = [
+        (bundled / "DejaVuSans.ttf", bundled / "DejaVuSans-Bold.ttf"),
         (Path(r"C:\Windows\Fonts\arial.ttf"), Path(r"C:\Windows\Fonts\arialbd.ttf")),
         (
             Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
@@ -750,42 +882,104 @@ def _pdf_bytes(pdf) -> bytes:
 
 def _export_csv(tables: list[Table]) -> Export:
     if len(tables) == 1:
-        return Export(
-            data=_frame_to_csv_bytes(tables[0].frame),
-            mime="text/csv",
-            extension="csv",
-        )
+        data, quoted = _frame_to_csv_bytes(tables[0].frame)
+        return Export(data=data, mime="text/csv", extension="csv", note=_formula_note(quoted))
     buffer = io.BytesIO()
     used: set[str] = set()
+    quoted = 0
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for table in tables:
             filename = _unique_name(_safe_filename(table.name), used) + ".csv"
-            archive.writestr(filename, _frame_to_csv_bytes(table.frame))
+            data, count = _frame_to_csv_bytes(table.frame)
+            quoted += count
+            archive.writestr(filename, data)
+    note = "CSV holds one table, so each sheet was saved as its own CSV inside a zip file."
     return Export(
         data=buffer.getvalue(),
         mime="application/zip",
         extension="zip",
-        note="CSV holds one table, so each sheet was saved as its own CSV inside a zip file.",
+        note=f"{note} {_formula_note(quoted)}".strip(),
     )
 
 
-def _frame_to_csv_bytes(frame: pd.DataFrame) -> bytes:
+def _formula_note(count: int) -> str:
+    if not count:
+        return ""
+    return (
+        f"{count} cell(s) or header(s) that spreadsheets could run as formulas "
+        "were prefixed with an apostrophe."
+    )
+
+
+_FORMULA_TRIGGERS = set("=+@＝＋＠")
+_NUMERIC = re.compile(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$")
+
+
+def _is_formula(value: str) -> bool:
+    """True when a spreadsheet would treat the cell as a formula.
+
+    OWASP lists =, +, -, @, tab, carriage return, line feed, and the full-width
+    forms of those signs. A leading apostrophe stops Excel from evaluating the
+    cell. Negative numbers such as -5 stay numbers. Excel can strip that
+    apostrophe if a CSV is saved and opened again; the xlsx export keeps it.
+    """
+    text = value.lstrip(" \t\r\n\x00")
+    if not text:
+        return False
+    first = text[0]
+    if first in "-－":
+        rest = text[1:2]
+        # A lone dash or "- item" is plain text in Excel; "-cmd" is not.
+        if not rest or rest.isspace():
+            return False
+        return _NUMERIC.fullmatch(text.replace("－", "-")) is None
+    return first in _FORMULA_TRIGGERS
+
+
+def _neutralize_formulas(frame: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Prefix formula-like headers and text cells with a quote.
+
+    Returns the safe frame and how many values were changed.
+    """
+    changed = 0
+
+    def fix(value):
+        nonlocal changed
+        if isinstance(value, str) and _is_formula(value):
+            changed += 1
+            return "'" + value
+        return value
+
+    safe = frame.copy()
+    for column in safe.columns:
+        if safe[column].dtype == object or pd.api.types.is_string_dtype(safe[column].dtype):
+            safe[column] = safe[column].map(fix)
+    safe.columns = [fix(column) for column in safe.columns]
+    return safe, changed
+
+
+def _frame_to_csv_bytes(frame: pd.DataFrame) -> tuple[bytes, int]:
     buffer = io.StringIO()
-    frame.to_csv(buffer, index=False)
-    return buffer.getvalue().encode("utf-8-sig")
+    safe, changed = _neutralize_formulas(frame)
+    safe.to_csv(buffer, index=False)
+    return buffer.getvalue().encode("utf-8-sig"), changed
 
 
 def _export_excel(tables: list[Table]) -> Export:
     buffer = io.BytesIO()
     used: set[str] = set()
+    quoted = 0
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         for table in tables:
             sheet = _excel_sheet_name(table.name, used)
-            table.frame.to_excel(writer, index=False, sheet_name=sheet)
+            safe, changed = _neutralize_formulas(table.frame)
+            quoted += changed
+            safe.to_excel(writer, index=False, sheet_name=sheet)
     return Export(
         data=buffer.getvalue(),
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         extension="xlsx",
+        note=_formula_note(quoted),
     )
 
 
@@ -815,9 +1009,12 @@ def _export_xml(tables: list[Table]) -> Export:
             for tag, column in zip(tags, table.frame.columns):
                 cell = ET.SubElement(row, tag)
                 value = record.get(column)
-                cell.text = "" if value is None else str(value)
+                cell.text = "" if value is None else _XML_ILLEGAL.sub("", str(value))
     xml_bytes = ET.tostring(root, encoding="utf-8", xml_declaration=True)
     return Export(data=xml_bytes, mime="application/xml", extension="xml")
+
+
+_XML_ILLEGAL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
 
 
 def _xml_tags(columns: list) -> list[str]:

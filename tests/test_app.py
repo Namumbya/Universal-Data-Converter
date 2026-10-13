@@ -32,3 +32,43 @@ def test_sample_csv_and_xml_preview_real_rows():
     assert not app.exception
     xml_preview = app.dataframe[0].value
     assert xml_preview["name"].tolist() == ["Alice", "Bob"]
+
+
+def test_upload_without_an_extension_is_explained():
+    app = _app()
+    app.file_uploader[0].set_value(("notes", b"hello", "application/octet-stream"))
+    app.run()
+    message = " ".join(str(item.value) for item in [*app.exception, *app.error])
+    assert "extension" in message.lower()
+
+
+def test_corrupt_upload_is_explained():
+    app = _app()
+    app.file_uploader[0].set_value(("broken.pdf", b"not a pdf", "application/pdf"))
+    app.run()
+    assert any("PDF" in error.value for error in app.error)
+
+
+def test_word_sample_previews_as_pdf_document():
+    app = _app()
+    app.selectbox[0].set_value("PDF (.pdf)")
+    app.selectbox[1].set_value("Word")
+    app.run()
+    assert not app.exception
+    assert app.text_area
+    assert app.download_button[0].label == "Download sample.pdf"
+
+
+def test_every_sample_converts_to_every_format():
+    from converter import SUPPORTED_OUTPUTS
+
+    app = _app()
+    for sample in ["CSV", "JSON", "XML", "Markdown", "Word", "PDF"]:
+        for output in SUPPORTED_OUTPUTS:
+            app.selectbox[0].set_value(output)
+            app.selectbox[1].set_value(sample)
+            app.run()
+            assert not app.exception, (sample, output)
+            assert not app.error, (sample, output, [e.value for e in app.error])
+            assert app.download_button
+

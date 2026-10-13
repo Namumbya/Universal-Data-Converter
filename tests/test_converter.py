@@ -73,7 +73,7 @@ def test_sample_xml_reads_nested_records_not_an_empty_column():
     frame = tables[0].frame
     assert frame["name"].tolist() == ["Alice", "Bob"]
     assert frame["amount"].tolist() == ["10.5", "9.0"]
-    assert "item" not in frame.columns or frame["name"].notna().all()
+    assert list(frame.columns) == ["id", "name", "amount"]
 
 
 def test_xml_attributes_become_columns():
@@ -241,6 +241,53 @@ def test_csv_exports_to_pdf():
     assert exported.data.startswith(b"%PDF")
 
 
+def test_word_pdf_keeps_the_document_text():
+    from docx import Document
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    document = Document()
+    document.add_heading("1.1 Requirements Definition — Definition of Ready", level=2)
+    item = document.add_paragraph("Business objective is clearly defined")
+    properties = item._p.get_or_add_pPr()
+    numbering = OxmlElement("w:numPr")
+    level = OxmlElement("w:ilvl")
+    level.set(qn("w:val"), "0")
+    number = OxmlElement("w:numId")
+    number.set(qn("w:val"), "1")
+    numbering.append(level)
+    numbering.append(number)
+    properties.append(numbering)
+    section = document.add_table(rows=2, cols=1)
+    section.rows[0].cells[0].text = "3.1 Python"
+    section.rows[1].cells[0].text = "Ruff — lint and format"
+    buffer = io.BytesIO()
+    document.save(buffer)
+    raw = buffer.getvalue()
+
+    preview = converter.docx_preview_text(raw)
+    assert "Requirements Definition — Definition of Ready" in preview
+    assert "• Business objective is clearly defined" in preview
+    assert "3.1 Python" in preview
+    assert "Ruff — lint and format" in preview
+
+    exported = converter.docx_to_pdf(raw)
+    import pdfplumber
+
+    with pdfplumber.open(io.BytesIO(exported.data)) as pdf:
+        text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+    assert "—" in text
+    assert "3.1 Python" in text
+    assert "Ruff — lint and format" in text
+    assert "Business objective is clearly defined" in text
+
+
+def test_bundled_fonts_are_in_the_repo():
+    fonts = ROOT / "fonts"
+    assert (fonts / "DejaVuSans.ttf").is_file()
+    assert (fonts / "DejaVuSans-Bold.ttf").is_file()
+
+
 def test_word_document_converts_to_pdf():
     from docx import Document
 
@@ -273,18 +320,18 @@ def test_word_document_converts_to_pdf():
 
 def test_pdf_and_word_convert_both_ways():
     tables, _ = load_tables((SAMPLES / "sample.csv").read_bytes(), ".csv")
-    pdf_export = export_tables(tables, "Word (.docx)")
-    assert pdf_export.extension == "docx"
-    as_word, _ = load_tables(pdf_export.data, ".docx")
+    word_export = export_tables(tables, "Word (.docx)")
+    assert word_export.extension == "docx"
+    as_word, _ = load_tables(word_export.data, ".docx")
     assert as_word[0].frame["name"].tolist() == ["Alice", "Bob", "Carol"]
 
     word_pdf = converter.docx_to_pdf((SAMPLES / "sample.docx").read_bytes())
     assert word_pdf.extension == "pdf"
-    from_pdf, _ = load_tables(word_pdf.data, ".pdf")
-    assert "Alice" in from_pdf[0].frame.astype(str).to_string()
-    back_to_word = export_tables(from_pdf, "Word (.docx)")
-    reloaded, _ = load_tables(back_to_word.data, ".docx")
-    assert "Alice" in reloaded[0].frame.astype(str).to_string()
+    import pdfplumber
+
+    with pdfplumber.open(io.BytesIO(word_pdf.data)) as pdf:
+        pdf_text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+    assert "Alice" in pdf_text and "Carol" in pdf_text
 
 
 def test_markdown_without_a_table_is_rejected():
@@ -292,8 +339,198 @@ def test_markdown_without_a_table_is_rejected():
         load_tables(b"# Notes\n\nJust a paragraph.\n", ".md")
 
 
-def test_pdf_without_pdfplumber_explains_the_gap(monkeypatch):
-    monkeypatch.setattr(converter, "pdfplumber", None)
-    tables, warnings = load_tables(b"%PDF-1.4 hello", ".pdf")
-    assert "text" in tables[0].frame.columns
-    assert any("pdfplumber" in warning for warning in warnings)
+def test_oversized_and_zip_bomb_files_are_rejected(monkeypatch):
+    monkeypatch.setattr(converter, "MAX_UPLOAD_BYTES", 10)
+    with pytest.raises(ValueError, match="50 MB"):
+        load_tables(b"a,b\n1,2\n3,4\n", ".csv")
+    monkeypatch.undo()
+
+    monkeypatch.setattr(converter, "MAX_UNPACKED_BYTES", 100)
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("big.txt", "0" * 10_000)
+    with pytest.raises(ValueError, match="expands"):
+        load_tables(buffer.getvalue(), ".xlsx")
+
+
+def test_csv_and_excel_exports_neutralize_formulas():
+    frame = pd.DataFrame(
+        {"v": ["=1+1", "@SUM(A1)", "+cmd", "-5", "-1e-3", "-x", "plain", "\t=1+1", "＝1"]}
+    )
+    values = pd.read_csv(io.BytesIO(export_tables([Table("T", frame)], "CSV").data))["v"].tolist()
+    assert values == ["'=1+1", "'@SUM(A1)", "'+cmd", "-5", "-1e-3", "'-x", "plain", "'\t=1+1", "'＝1"]
+
+    reloaded, _ = load_tables(export_tables([Table("T", frame)], "Excel (.xlsx)").data, ".xlsx")
+    assert reloaded[0].frame["v"].tolist()[0] == "'=1+1"
+    assert float(reloaded[0].frame["v"].tolist()[3]) == -5
+
+
+def test_xml_export_strips_control_characters():
+    frame = pd.DataFrame({"note": ["ab"]})
+    exported = export_tables([Table("T", frame)], "XML")
+    reloaded, _ = load_tables(exported.data, ".xml")
+    assert reloaded[0].frame.loc[0, "note"] == "ab"
+
+
+def test_corrupt_files_give_friendly_errors():
+    with pytest.raises(ValueError, match="PDF"):
+        load_tables(b"not a pdf", ".pdf")
+    with pytest.raises(ValueError, match="Word"):
+        load_tables(b"not a docx", ".docx")
+    with pytest.raises(ValueError, match="Excel"):
+        load_tables(b"not an xlsx", ".xlsx")
+
+
+def test_word_without_tables_falls_back_to_text():
+    from docx import Document
+
+    document = Document()
+    document.add_paragraph("First line")
+    document.add_paragraph("Second line")
+    buffer = io.BytesIO()
+    document.save(buffer)
+
+    tables, warnings = load_tables(buffer.getvalue(), ".docx")
+    assert tables[0].frame["text"].tolist() == ["First line", "Second line"]
+    assert any("No tables" in warning for warning in warnings)
+
+
+def test_word_merged_cells_are_not_duplicated():
+    from docx import Document
+
+    document = Document()
+    table = document.add_table(rows=2, cols=2)
+    table.rows[0].cells[0].text = "a"
+    table.rows[0].cells[1].text = "b"
+    merged = table.rows[1].cells[0].merge(table.rows[1].cells[1])
+    merged.text = "only once"
+    buffer = io.BytesIO()
+    document.save(buffer)
+
+    tables, _ = load_tables(buffer.getvalue(), ".docx")
+    assert tables[0].frame.iloc[0].tolist() == ["only once", ""]
+
+
+def test_pdf_notes_pages_without_tables(monkeypatch):
+    class Page:
+        def __init__(self, with_table):
+            self.with_table = with_table
+
+        def extract_tables(self):
+            return [[["a", "b"], ["1", "2"]]] if self.with_table else []
+
+        def extract_text(self):
+            return "text"
+
+    class Document:
+        pages = [Page(True), Page(False)]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(converter.pdfplumber, "open", lambda *_a, **_k: Document())
+    tables, warnings = load_tables(b"%PDF", ".pdf")
+    assert list(tables[0].frame.columns) == ["a", "b"]
+    assert tables[1].name == "Page2_Text"
+    assert tables[1].frame.loc[0, "text"] == "text"
+    assert any("exported as text: 2" in warning for warning in warnings)
+
+
+def test_pdf_export_caps_rows(monkeypatch):
+    monkeypatch.setattr(converter, "MAX_PDF_ROWS", 3)
+    frame = pd.DataFrame({"n": range(10)})
+    exported = export_tables([Table("T", frame)], "PDF (.pdf)")
+    assert "first 3 rows" in exported.note
+
+
+def test_sheet_names_are_truncated_and_unique():
+    long_name = "x" * 40
+    tables = [Table(long_name, pd.DataFrame({"a": [1]})), Table(long_name, pd.DataFrame({"a": [2]}))]
+    reloaded, _ = load_tables(export_tables(tables, "Excel (.xlsx)").data, ".xlsx")
+    names = [table.name for table in reloaded]
+    assert len(set(names)) == 2 and all(len(name) <= 31 for name in names)
+
+
+def test_empty_frames_export_in_every_format():
+    tables = [Table("Empty", pd.DataFrame())]
+    for output in converter.SUPPORTED_OUTPUTS:
+        assert export_tables(tables, output).data
+
+
+def test_old_excel_xls_round_trip():
+    tables, warnings = load_tables((SAMPLES / "sample.xls").read_bytes(), ".xls")
+    assert warnings == []
+    assert tables[0].name == "People"
+    assert tables[0].frame["name"].tolist() == ["Alice", "Bob"]
+
+
+def test_pdf_without_unicode_font_replaces_unknown_characters(monkeypatch):
+    from docx import Document
+
+    monkeypatch.setattr(converter, "_pdf_font_files", lambda: (None, None))
+    document = Document()
+    document.add_paragraph("Size — large")
+    buffer = io.BytesIO()
+    document.save(buffer)
+    exported = converter.docx_to_pdf(buffer.getvalue())
+    import pdfplumber
+
+    with pdfplumber.open(io.BytesIO(exported.data)) as pdf:
+        text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+    assert "—" not in text
+    assert "Size ? large" in text
+
+
+def test_xml_tags_for_symbols_and_xml_prefix():
+    frame = pd.DataFrame([{"!!!": "a", "xmlId": "b"}])
+    exported = export_tables([Table("T", frame)], "XML")
+    ET.fromstring(exported.data)
+    reloaded, _ = load_tables(exported.data, ".xml")
+    assert list(reloaded[0].frame.columns) == ["field", "f_xmlId"]
+
+
+def test_markdown_ignores_fenced_code_headings():
+    text = ("# Real", "", "```", "# fake", "```", "", "| a |", "| --- |", "| 1 |", "")
+    text = "\n".join(text).encode()
+    tables, _ = load_tables(text, ".md")
+    assert tables[0].name == "Real"
+
+
+def test_formula_headers_are_neutralized_and_reported():
+    frame = pd.DataFrame({'=HYPERLINK("http://x")': ["a"], "note": ["-x"]})
+    exported = export_tables([Table("T", frame)], "CSV")
+    header = exported.data.decode("utf-8-sig").splitlines()[0]
+    assert header.startswith("\"'=HYPERLINK")
+    assert "2 cell(s)" in exported.note
+
+    excel = export_tables([Table("T", frame)], "Excel (.xlsx)")
+    assert "2 cell(s)" in excel.note
+    reloaded, _ = load_tables(excel.data, ".xlsx")
+    assert str(reloaded[0].frame.columns[0]).startswith("'=")
+
+
+def test_placeholder_dashes_are_left_alone():
+    frame = pd.DataFrame({"v": ["-", "- item", "-5", "n/a"]})
+    exported = export_tables([Table("T", frame)], "CSV")
+    assert exported.note == ""
+    values = pd.read_csv(io.BytesIO(exported.data), keep_default_na=False)["v"].tolist()
+    assert values == ["-", "- item", "-5", "n/a"]
+
+
+def test_word_file_is_parsed_once_for_text_fallback(monkeypatch):
+    from docx import Document
+
+    document = Document()
+    document.add_paragraph("Only text")
+    buffer = io.BytesIO()
+    document.save(buffer)
+
+    calls = []
+    original = converter._docx_blocks
+    monkeypatch.setattr(converter, "_docx_blocks", lambda data: calls.append(1) or original(data))
+    tables, _ = load_tables(buffer.getvalue(), ".docx")
+    assert tables[0].frame["text"].tolist() == ["Only text"]
+    assert len(calls) == 1
