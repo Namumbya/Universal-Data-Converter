@@ -1,30 +1,33 @@
-# 🔁 Universal Data Converter (Streamlit)
+# Universal Data Converter
 
-Convert CSV, Excel, JSON, XML, and (best‑effort) PDF tables into your desired format — right in the browser.
+Convert CSV, Excel, JSON, XML, Markdown, and PDF tables in the browser.
 
-## Features
-- Upload **CSV, Excel (.xlsx/.xls), JSON, XML, PDF**
-- Convert to **CSV / Excel (.xlsx) / JSON / XML**
-- Preview before download
-- Multi‑sheet Excel support (exports all sheets to a single .xlsx)
-- Best‑effort PDF table extraction via `pdfplumber` (no Java required)
+Upload a file, preview the table, and download CSV, Excel, JSON, XML, or Markdown. Sample files are in [samples](samples).
 
-## Quickstart (local)
+## Run
+
+Requires [uv](https://docs.astral.sh/uv/) and Python 3.14 or newer.
+
 ```bash
-python -m venv venv
-# Windows
-venv\Scripts\activate
-# macOS/Linux
-source venv/bin/activate
-
-pip install -r requirements.txt
-streamlit run app.py
+uv sync
+uv run streamlit run app.py
 ```
 
-## Deploy (Streamlit Cloud)
-- Push to GitHub with `app.py` and `requirements.txt`
-- Create an app from your repo; set main file to `app.py`
+Open the URL Streamlit prints. Uploads are limited to 50 MB.
+
+## Tests
+
+```bash
+uv sync --group dev
+uv run pytest
+```
+
+## Deploy
+
+On Streamlit Community Cloud, set the main file to `app.py`. Cloud installs the packages in `requirements.txt`.
 
 ## Notes
-- PDF extraction is best‑effort; quality depends on the PDF's structure.
-- For complex PDFs or scans, consider dedicated OCR/tabular services. This app will gracefully fallback to text.
+
+- PDF table extraction is best-effort and does not read scanned pages. At most 25 pages are scanned.
+- A workbook downloaded as CSV is a zip with one CSV per sheet. Markdown keeps every sheet in one file.
+- Markdown input must be a pipe table (`| column |` and a `| --- |` row).
