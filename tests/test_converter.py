@@ -227,6 +227,66 @@ def test_markdown_escapes_pipes_and_keeps_multiple_sheets():
     assert reloaded[1].frame.loc[0, "sku"] == "A-1"
 
 
+def test_output_choices_include_markdown_and_pdf():
+    assert "Markdown (.md)" in converter.SUPPORTED_OUTPUTS
+    assert "PDF (.pdf)" in converter.SUPPORTED_OUTPUTS
+    assert "Word (.docx)" in converter.SUPPORTED_OUTPUTS
+    assert ".docx" in converter.SUPPORTED_INPUTS
+
+
+def test_csv_exports_to_pdf():
+    tables, _ = load_tables((SAMPLES / "sample.csv").read_bytes(), ".csv")
+    exported = export_tables(tables, "PDF (.pdf)")
+    assert exported.extension == "pdf"
+    assert exported.data.startswith(b"%PDF")
+
+
+def test_word_document_converts_to_pdf():
+    from docx import Document
+
+    document = Document()
+    document.add_heading("Report", level=1)
+    document.add_paragraph("Hello from Word")
+    table = document.add_table(rows=2, cols=2)
+    table.rows[0].cells[0].text = "name"
+    table.rows[0].cells[1].text = "city"
+    table.rows[1].cells[0].text = "Ada"
+    table.rows[1].cells[1].text = "Paris"
+    buffer = io.BytesIO()
+    document.save(buffer)
+    raw = buffer.getvalue()
+
+    tables, _ = load_tables(raw, ".docx")
+    assert tables[0].frame.loc[0, "name"] == "Ada"
+    assert tables[0].frame.loc[0, "city"] == "Paris"
+
+    exported = converter.docx_to_pdf(raw)
+    assert exported.extension == "pdf"
+    assert exported.data.startswith(b"%PDF")
+    import pdfplumber
+
+    with pdfplumber.open(io.BytesIO(exported.data)) as pdf:
+        text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+    assert "Hello from Word" in text
+    assert "Ada" in text
+
+
+def test_pdf_and_word_convert_both_ways():
+    tables, _ = load_tables((SAMPLES / "sample.csv").read_bytes(), ".csv")
+    pdf_export = export_tables(tables, "Word (.docx)")
+    assert pdf_export.extension == "docx"
+    as_word, _ = load_tables(pdf_export.data, ".docx")
+    assert as_word[0].frame["name"].tolist() == ["Alice", "Bob", "Carol"]
+
+    word_pdf = converter.docx_to_pdf((SAMPLES / "sample.docx").read_bytes())
+    assert word_pdf.extension == "pdf"
+    from_pdf, _ = load_tables(word_pdf.data, ".pdf")
+    assert "Alice" in from_pdf[0].frame.astype(str).to_string()
+    back_to_word = export_tables(from_pdf, "Word (.docx)")
+    reloaded, _ = load_tables(back_to_word.data, ".docx")
+    assert "Alice" in reloaded[0].frame.astype(str).to_string()
+
+
 def test_markdown_without_a_table_is_rejected():
     with pytest.raises(ValueError, match="Markdown"):
         load_tables(b"# Notes\n\nJust a paragraph.\n", ".md")

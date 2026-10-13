@@ -22,8 +22,16 @@ try:
 except ImportError:  # pragma: no cover - exercised when the extra is absent
     pdfplumber = None
 
-SUPPORTED_INPUTS = [".csv", ".xlsx", ".xls", ".json", ".xml", ".pdf", ".md"]
-SUPPORTED_OUTPUTS = ["CSV", "Excel (.xlsx)", "JSON", "XML", "Markdown"]
+SUPPORTED_INPUTS = [".csv", ".xlsx", ".xls", ".json", ".xml", ".pdf", ".md", ".docx"]
+SUPPORTED_OUTPUTS = [
+    "CSV",
+    "Excel (.xlsx)",
+    "JSON",
+    "XML",
+    "Markdown (.md)",
+    "PDF (.pdf)",
+    "Word (.docx)",
+]
 
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 MAX_PDF_PAGES = 25
@@ -68,6 +76,8 @@ def load_tables(source, suffix: str) -> tuple[list[Table], list[str]]:
         tables = _pdf_tables(data, warnings)
     elif kind in {".md", ".markdown"}:
         tables = _markdown_tables(data)
+    elif kind == ".docx":
+        tables = _docx_tables(data, warnings)
     else:
         supported = ", ".join(SUPPORTED_INPUTS)
         raise ValueError(f"Unsupported input '{kind}'. Use one of: {supported}.")
@@ -93,6 +103,10 @@ def export_tables(tables: list[Table], output: str) -> Export:
         return _export_xml(tables)
     if kind == "markdown":
         return _export_markdown(tables)
+    if kind == "pdf":
+        return _export_pdf(tables)
+    if kind == "word":
+        return _export_docx(tables)
     raise ValueError(f"Unsupported output format: {output}")
 
 
@@ -124,6 +138,10 @@ def _normalize_output(output: str) -> str:
         return "xml"
     if text in {"markdown", "md"} or text.startswith("markdown"):
         return "markdown"
+    if text.startswith("word") or "docx" in text:
+        return "word"
+    if text == "pdf" or text.startswith("pdf"):
+        return "pdf"
     raise ValueError(f"Unsupported output format: {output}")
 
 
@@ -524,6 +542,210 @@ def _markdown_cell(value) -> str:
     text = "" if value is None else str(value)
     text = text.replace("\\", "\\\\").replace("|", "\\|")
     return text.replace("\r\n", " ").replace("\n", " ").strip()
+
+
+def docx_to_pdf(data: bytes) -> Export:
+    """Turn a Word document into a PDF of its text and tables."""
+    pdf, family, has_bold, unicode_font = _new_pdf()
+    wrote = False
+    for block in _docx_blocks(data):
+        if block[0] == "paragraph":
+            text = block[1].strip()
+            if not text:
+                pdf.ln(3)
+                continue
+            if block[2]:
+                pdf.set_font(family, "B" if has_bold else "", 16)
+                pdf.multi_cell(0, 8, _pdf_text(text, unicode_font))
+                pdf.ln(2)
+            else:
+                pdf.set_font(family, size=12)
+                pdf.multi_cell(0, 7, _pdf_text(text, unicode_font))
+                pdf.ln(1)
+            wrote = True
+        else:
+            _write_pdf_table(pdf, block[1], family, unicode_font)
+            pdf.ln(4)
+            wrote = True
+    if not wrote:
+        raise ValueError("The Word file has no text or tables to convert.")
+    return Export(data=_pdf_bytes(pdf), mime="application/pdf", extension="pdf")
+
+
+def _docx_tables(data: bytes, warnings: list[str]) -> list[Table]:
+    tables = []
+    for name, rows in _docx_table_rows(data):
+        if not rows:
+            continue
+        columns = _dedupe_headers(rows[0])
+        body = [_pad(row, len(columns)) for row in rows[1:]]
+        tables.append(Table(name, pd.DataFrame(body, columns=columns)))
+    if tables:
+        return tables
+    lines = [text for _kind, text, _heading in _docx_blocks(data) if _kind == "paragraph" and text.strip()]
+    if not lines:
+        raise ValueError("The Word file has no text or tables.")
+    warnings.append("No tables were found in the Word file. Preview shows the document text.")
+    return [Table("Text", pd.DataFrame({"text": [line.strip() for line in lines]}))]
+
+
+def _docx_blocks(data: bytes):
+    from docx import Document
+    from docx.oxml.table import CT_Tbl
+    from docx.oxml.text.paragraph import CT_P
+    from docx.table import Table as DocxTable
+    from docx.text.paragraph import Paragraph
+
+    try:
+        document = Document(io.BytesIO(data))
+    except Exception as exc:
+        raise ValueError(f"Could not read the Word file: {exc}") from exc
+    for child in document.element.body.iterchildren():
+        if isinstance(child, CT_P):
+            paragraph = Paragraph(child, document)
+            style = ""
+            if paragraph.style is not None and paragraph.style.name:
+                style = paragraph.style.name
+            yield ("paragraph", paragraph.text or "", style.startswith("Heading"))
+        elif isinstance(child, CT_Tbl):
+            yield ("table", _docx_rows(DocxTable(child, document)))
+
+
+def _docx_table_rows(data: bytes):
+    index = 0
+    for kind, payload, *_rest in _docx_blocks(data):
+        if kind != "table":
+            continue
+        index += 1
+        yield f"Table{index}", payload
+
+
+def _docx_rows(table) -> list[list[str]]:
+    return [[cell.text.strip() for cell in row.cells] for row in table.rows]
+
+
+def _export_pdf(tables: list[Table]) -> Export:
+    pdf, family, _has_bold, unicode_font = _new_pdf()
+    several = len(tables) > 1
+    for index, table in enumerate(tables, start=1):
+        if several:
+            pdf.set_font(family, size=14)
+            pdf.multi_cell(0, 8, _pdf_text(table.name or f"Sheet {index}", unicode_font))
+            pdf.ln(2)
+        _write_pdf_table(pdf, _frame_rows(table.frame), family, unicode_font)
+        pdf.ln(4)
+    return Export(data=_pdf_bytes(pdf), mime="application/pdf", extension="pdf")
+
+
+def _export_docx(tables: list[Table]) -> Export:
+    from docx import Document
+
+    document = Document()
+    several = len(tables) > 1
+    for index, table in enumerate(tables, start=1):
+        frame = table.frame
+        if several:
+            document.add_heading(table.name or f"Sheet {index}", level=1)
+        if list(frame.columns) == ["text"]:
+            for value in frame["text"].tolist():
+                document.add_paragraph("" if value is None else str(value))
+            continue
+        rows = _frame_rows(frame)
+        if not rows or not rows[0]:
+            continue
+        word_table = document.add_table(rows=len(rows), cols=len(rows[0]))
+        for row_index, row in enumerate(rows):
+            for column_index, value in enumerate(row):
+                word_table.rows[row_index].cells[column_index].text = "" if value is None else str(value)
+    buffer = io.BytesIO()
+    document.save(buffer)
+    return Export(
+        data=buffer.getvalue(),
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        extension="docx",
+    )
+
+
+def _frame_rows(frame: pd.DataFrame) -> list[list[str]]:
+    columns = ["" if column is None else str(column) for column in frame.columns]
+    rows = [columns]
+    for record in _records(frame):
+        rows.append(
+            [
+                "" if record.get(column) is None else str(record.get(column))
+                for column in frame.columns
+            ]
+        )
+    return rows
+
+
+def _write_pdf_table(pdf, rows: list[list[str]], family: str, unicode_font: bool) -> None:
+    if not rows or not rows[0]:
+        return
+    pdf.set_font(family, size=10)
+    with pdf.table(width=pdf.epw) as pdf_table:
+        for row in rows:
+            pdf_row = pdf_table.row()
+            width = len(rows[0])
+            values = list(row[:width])
+            if len(values) < width:
+                values.extend([""] * (width - len(values)))
+            for value in values:
+                pdf_row.cell(_pdf_text(value, unicode_font))
+
+
+def _new_pdf():
+    from fpdf import FPDF
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+    family, has_bold, unicode_font = _register_pdf_font(pdf)
+    pdf.set_font(family, size=12)
+    return pdf, family, has_bold, unicode_font
+
+
+def _register_pdf_font(pdf) -> tuple[str, bool, bool]:
+    regular, bold = _pdf_font_files()
+    if regular is None:
+        return "Helvetica", True, False
+    pdf.add_font("AppSans", "", str(regular))
+    has_bold = bold is not None
+    if has_bold:
+        pdf.add_font("AppSans", "B", str(bold))
+    return "AppSans", has_bold, True
+
+
+def _pdf_font_files() -> tuple[Path | None, Path | None]:
+    from pathlib import Path
+
+    candidates = [
+        (Path(r"C:\Windows\Fonts\arial.ttf"), Path(r"C:\Windows\Fonts\arialbd.ttf")),
+        (
+            Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+            Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+        ),
+        (
+            Path("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"),
+            Path("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"),
+        ),
+    ]
+    for regular, bold in candidates:
+        if regular.is_file():
+            return regular, bold if bold.is_file() else None
+    return None, None
+
+
+def _pdf_text(value, unicode_font: bool) -> str:
+    text = "" if value is None else str(value)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    if unicode_font:
+        return text
+    return text.encode("latin-1", errors="replace").decode("latin-1")
+
+
+def _pdf_bytes(pdf) -> bytes:
+    return bytes(pdf.output())
 
 
 def _export_csv(tables: list[Table]) -> Export:

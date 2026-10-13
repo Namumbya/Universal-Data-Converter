@@ -6,6 +6,7 @@ from converter import (
     MAX_UPLOAD_BYTES,
     SUPPORTED_INPUTS,
     SUPPORTED_OUTPUTS,
+    docx_to_pdf,
     export_tables,
     load_tables,
 )
@@ -16,6 +17,8 @@ SAMPLES = {
     "JSON": ROOT / "samples" / "sample.json",
     "XML": ROOT / "samples" / "sample.xml",
     "Markdown": ROOT / "samples" / "sample.md",
+    "Word": ROOT / "samples" / "sample.docx",
+    "PDF": ROOT / "samples" / "sample.pdf",
 }
 PREVIEW_ROWS = 100
 
@@ -34,7 +37,7 @@ class NamedUpload:
 
 st.set_page_config(page_title="Universal Data Converter", page_icon="🔁", layout="wide")
 st.title("🔁 Universal Data Converter")
-st.caption("Convert CSV, Excel, JSON, XML, PDF, and Markdown tables without leaving the browser.")
+st.caption("Convert CSV, Excel, JSON, XML, Markdown, PDF, and Word files in the browser.")
 
 st.sidebar.header("Settings")
 out_fmt = st.sidebar.selectbox("Output format", SUPPORTED_OUTPUTS, index=0)
@@ -76,8 +79,9 @@ for index, upload in enumerate(sources):
         st.error(f"{upload.name} needs a file extension such as .csv or .xlsx.")
         continue
 
+    raw = upload.getvalue() if hasattr(upload, "getvalue") else upload.read()
     try:
-        tables, warnings = load_tables(upload, suffix)
+        tables, warnings = load_tables(raw, suffix)
     except Exception as exc:
         st.error(f"Could not read {upload.name}: {exc}")
         continue
@@ -95,7 +99,10 @@ for index, upload in enumerate(sources):
             st.dataframe(table.frame.head(PREVIEW_ROWS), width="stretch")
 
     try:
-        exported = export_tables(tables, out_fmt)
+        if suffix == ".docx" and out_fmt.lower().startswith("pdf"):
+            exported = docx_to_pdf(raw)
+        else:
+            exported = export_tables(tables, out_fmt)
     except Exception as exc:
         st.error(f"Could not convert {upload.name}: {exc}")
         continue
