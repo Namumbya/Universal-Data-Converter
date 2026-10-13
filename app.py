@@ -10,6 +10,8 @@ from converter import (
     docx_to_pdf,
     export_tables,
     load_tables,
+    markdown_preview_text,
+    markdown_to_pdf,
 )
 
 ROOT = Path(__file__).resolve().parent
@@ -31,8 +33,10 @@ def cached_load(raw: bytes, suffix: str):
 
 @st.cache_data(show_spinner=False, max_entries=4, ttl=600)
 def cached_export(raw: bytes, suffix: str, out_fmt: str):
-    if suffix == ".docx" and out_fmt.lower().startswith("pdf"):
+    if out_fmt.lower().startswith("pdf") and suffix == ".docx":
         return docx_to_pdf(raw)
+    if out_fmt.lower().startswith("pdf") and suffix in {".md", ".markdown"}:
+        return markdown_to_pdf(raw)
     tables, _warnings = cached_load(raw, suffix)
     return export_tables(tables, out_fmt)
 
@@ -40,6 +44,11 @@ def cached_export(raw: bytes, suffix: str, out_fmt: str):
 @st.cache_data(show_spinner=False, max_entries=4, ttl=600)
 def cached_docx_preview(raw: bytes) -> str:
     return docx_preview_text(raw)
+
+
+@st.cache_data(show_spinner=False, max_entries=4, ttl=600)
+def cached_markdown_preview(raw: bytes) -> str:
+    return markdown_preview_text(raw)
 
 
 class NamedUpload:
@@ -99,22 +108,26 @@ for index, upload in enumerate(sources):
         continue
 
     raw = upload.getvalue() if hasattr(upload, "getvalue") else upload.read()
-    try:
-        tables, warnings = cached_load(raw, suffix)
-    except Exception as exc:
-        st.error(f"Could not read {upload.name}: {exc}")
-        continue
+    preview_document = out_fmt.lower().startswith("pdf") and suffix in {".docx", ".md", ".markdown"}
+    if preview_document:
+        tables, warnings = [], []
+    else:
+        try:
+            tables, warnings = cached_load(raw, suffix)
+        except Exception as exc:
+            st.error(f"Could not read {upload.name}: {exc}")
+            continue
 
     for warning in warnings:
         st.warning(warning)
 
-    preview_document = suffix == ".docx" and out_fmt.lower().startswith("pdf")
     with st.expander(f"Preview — {upload.name}", expanded=True):
         if preview_document:
             st.caption("Preview of the document that will be downloaded as a PDF.")
+            preview = cached_docx_preview(raw) if suffix == ".docx" else cached_markdown_preview(raw)
             st.text_area(
                 "Document",
-                value=cached_docx_preview(raw),
+                value=preview,
                 height=420,
                 disabled=True,
                 label_visibility="collapsed",

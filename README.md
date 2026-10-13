@@ -33,4 +33,4 @@ On Streamlit Community Cloud, set the main file to `app.py`. Cloud installs the 
 - Word and Excel files that would expand past 200 MB are refused.
 - A workbook downloaded as CSV is a zip with one CSV per sheet. Markdown keeps every sheet in one file.
 - Markdown input must be a pipe table (`| column |` and a `| --- |` row).
-- Output formats include Markdown (.md), PDF (.pdf), and Word (.docx). Word to PDF previews and downloads the document itself, including headings, lists, and characters such as dashes. PDF to Word keeps the extracted tables. A PDF that mixes tables and prose keeps both: the tables, and the text from pages that have none.
+- Output formats include Markdown (.md), PDF (.pdf), and Word (.docx). Word or Markdown to PDF previews and downloads the document itself, including headings, lists, and tables. PDF to Word keeps the extracted tables. A PDF that mixes tables and prose keeps both: the tables, and the text from pages that have none.

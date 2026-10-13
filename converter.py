@@ -6,6 +6,7 @@ The functions here do not import Streamlit, so they can be tested on their own.
 from __future__ import annotations
 
 import csv
+import html
 import io
 import json
 import re
@@ -544,6 +545,138 @@ def _split_markdown_row(line: str) -> list[str]:
         current.append("\\")
     cells.append("".join(current).strip())
     return cells
+
+
+_MARKDOWN_LIST = re.compile(r"^(?:[-*+]|\d+[.)])\s+(.*)$")
+
+
+def markdown_preview_text(data: bytes) -> str:
+    """Readable text of a Markdown file, in the same order the PDF uses."""
+    lines = []
+    for kind, payload in _markdown_document_blocks(data):
+        if kind == "table":
+            lines.extend(" | ".join(row) for row in payload if any(cell.strip() for cell in row))
+            continue
+        if kind == "rule":
+            lines.append("---")
+            continue
+        if kind == "list":
+            lines.append(_as_bullet(payload))
+            continue
+        if payload.strip():
+            lines.append(payload.strip())
+    if not lines:
+        raise ValueError("The Markdown file is empty.")
+    return "\n\n".join(lines)
+
+
+def markdown_to_pdf(data: bytes) -> Export:
+    """Turn a Markdown document into a PDF of its headings, lists, text, and tables."""
+    blocks = _markdown_document_blocks(data)
+    if not blocks:
+        raise ValueError("The Markdown file is empty.")
+    pdf, family, has_bold, unicode_font = _new_pdf()
+    wrote = False
+    for kind, payload in blocks:
+        if kind == "table":
+            rows = [[_plain_markdown(cell) for cell in row] for row in payload]
+            if rows and rows[0]:
+                _write_pdf_table(pdf, rows, family, unicode_font)
+                pdf.ln(3)
+                wrote = True
+            continue
+        if kind == "code":
+            text = payload.rstrip()
+            if not text:
+                continue
+            pdf.set_font(family, size=9)
+            pdf.multi_cell(0, 5, _pdf_text(text, unicode_font))
+            pdf.ln(1)
+            wrote = True
+            continue
+        if kind == "rule":
+            pdf.ln(1)
+            y_position = pdf.get_y()
+            pdf.line(pdf.l_margin, y_position, pdf.w - pdf.r_margin, y_position)
+            pdf.ln(2)
+            continue
+        role = kind if kind in _HEADING_SIZE or kind == "list" else "body"
+        if _write_pdf_paragraph(pdf, _plain_markdown(payload), role, family, has_bold, unicode_font):
+            wrote = True
+    if not wrote:
+        raise ValueError("The Markdown file has no text or tables to convert.")
+    return Export(data=_pdf_bytes(pdf), mime="application/pdf", extension="pdf")
+
+
+def _markdown_document_blocks(data: bytes) -> list[tuple[str, str | list[list[str]]]]:
+    lines = _decode_text(data).splitlines()
+    blocks: list[tuple[str, str | list[list[str]]]] = []
+    paragraph: list[str] = []
+
+    def flush() -> None:
+        text = " ".join(part.strip() for part in paragraph).strip()
+        paragraph.clear()
+        if text:
+            blocks.append(("paragraph", text))
+
+    index = 0
+    while index < len(lines):
+        stripped = lines[index].strip()
+        if not stripped:
+            flush()
+            index += 1
+            continue
+        if stripped.startswith(("```", "~~~")):
+            flush()
+            fence = stripped[:3]
+            code: list[str] = []
+            index += 1
+            while index < len(lines) and not lines[index].strip().startswith(fence):
+                code.append(lines[index])
+                index += 1
+            index += 1
+            blocks.append(("code", "\n".join(code).rstrip()))
+            continue
+        if re.fullmatch(r"(?:-{3,}|\*{3,}|_{3,})", stripped):
+            flush()
+            blocks.append(("rule", ""))
+            index += 1
+            continue
+        if stripped.startswith("#"):
+            flush()
+            marks = len(stripped) - len(stripped.lstrip("#"))
+            text = stripped[marks:].strip()
+            level = min(marks, 3) or 1
+            blocks.append((f"heading{level}", text))
+            index += 1
+            continue
+        if _is_markdown_table(lines, index):
+            flush()
+            rows = [_split_markdown_row(lines[index])]
+            index += 2
+            while index < len(lines) and lines[index].strip().startswith("|"):
+                rows.append(_split_markdown_row(lines[index]))
+                index += 1
+            blocks.append(("table", rows))
+            continue
+        item = _MARKDOWN_LIST.match(stripped)
+        if item:
+            flush()
+            blocks.append(("list", item.group(1)))
+            index += 1
+            continue
+        paragraph.append(stripped)
+        index += 1
+    flush()
+    return blocks
+
+
+def _plain_markdown(text: str) -> str:
+    """Drop emphasis markers so snake_case and code ticks stay readable in the PDF."""
+    plain = html.unescape(text or "")
+    plain = re.sub(r"\*\*(.+?)\*\*", r"\1", plain)
+    plain = re.sub(r"(?<!\*)\*(.+?)\*(?!\*)", r"\1", plain)
+    return plain.replace("`", "")
 
 
 def _export_markdown(tables: list[Table]) -> Export:

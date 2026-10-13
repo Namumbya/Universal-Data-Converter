@@ -492,6 +492,43 @@ def test_xml_tags_for_symbols_and_xml_prefix():
     assert list(reloaded[0].frame.columns) == ["field", "f_xmlId"]
 
 
+def test_markdown_pdf_keeps_prose_as_well_as_tables():
+    raw = "\n".join(
+        [
+            "# Thesis",
+            "",
+            "Phase 1 builds a hub.",
+            "",
+            "- Entra SSO",
+            "",
+            "| Service | Owns |",
+            "| --- | --- |",
+            "| Search | Query records |",
+            "",
+            "```json",
+            '{"email": "ada@example.com"}',
+            "```",
+            "",
+        ]
+    ).encode()
+    preview = converter.markdown_preview_text(raw)
+    assert "Thesis" in preview
+    assert "Phase 1 builds a hub." in preview
+    assert "• Entra SSO" in preview
+    assert "Search | Query records" in preview
+
+    exported = converter.markdown_to_pdf(raw)
+    import pdfplumber
+
+    with pdfplumber.open(io.BytesIO(exported.data)) as pdf:
+        text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+    assert "Thesis" in text
+    assert "Phase 1 builds a hub." in text
+    assert "Entra SSO" in text
+    assert "Query records" in text
+    assert "ada@example.com" in text
+
+
 def test_markdown_ignores_fenced_code_headings():
     text = ("# Real", "", "```", "# fake", "```", "", "| a |", "| --- |", "| 1 |", "")
     text = "\n".join(text).encode()
