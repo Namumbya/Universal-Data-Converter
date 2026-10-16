@@ -2,7 +2,7 @@
 
 Convert CSV, Excel, JSON, XML, Markdown, PDF, and Word files in the browser.
 
-Upload a file, preview it, and download CSV, Excel, JSON, XML, Markdown, or PDF. A Word file (`.docx`) can be downloaded as a PDF. Sample files are in [samples](samples).
+Upload a file, preview it, and download CSV, Excel, JSON, XML, Markdown, PDF, or Word. A Word or Markdown file can be downloaded as a PDF or Word document of the full text. Sample files are in [samples](samples).
 
 ## Run
 
@@ -32,5 +32,5 @@ On Streamlit Community Cloud, set the main file to `app.py`. Cloud installs the 
 - CSV and Excel cells that look like formulas (`=`, `+`, `@`, or a minus sign that is not a number) are prefixed with `'` so the spreadsheet does not run them.
 - Word and Excel files that would expand past 200 MB are refused.
 - A workbook downloaded as CSV is a zip with one CSV per sheet. Markdown keeps every sheet in one file.
-- Markdown input must be a pipe table (`| column |` and a `| --- |` row).
-- Output formats include Markdown (.md), PDF (.pdf), and Word (.docx). Word or Markdown to PDF previews and downloads the document itself, including headings, lists, and tables. PDF to Word keeps the extracted tables. A PDF that mixes tables and prose keeps both: the tables, and the text from pages that have none.
+- Markdown to CSV, Excel, JSON, XML, or Markdown keeps pipe tables only (`| column |` and a `| --- |` row). Markdown to PDF or Word keeps the whole document: headings, lists, prose, code, and tables.
+- Output formats include Markdown (.md), PDF (.pdf), and Word (.docx). Word to PDF and Markdown to PDF or Word preview and download the document itself. PDF to Word keeps the extracted tables. A PDF that mixes tables and prose keeps both: the tables, and the text from pages that have none.

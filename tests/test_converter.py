@@ -528,6 +528,19 @@ def test_markdown_pdf_keeps_prose_as_well_as_tables():
     assert "Query records" in text
     assert "ada@example.com" in text
 
+    word = converter.markdown_to_docx(raw)
+    assert word.extension == "docx"
+    from docx import Document
+
+    document = Document(io.BytesIO(word.data))
+    paragraphs = [paragraph.text for paragraph in document.paragraphs]
+    joined = "\n".join(paragraphs)
+    assert "Thesis" in joined
+    assert "Phase 1 builds a hub." in joined
+    assert "Entra SSO" in joined
+    assert any("Query records" in cell.text for table in document.tables for row in table.rows for cell in row.cells)
+    assert "ada@example.com" in joined
+
 
 def test_markdown_ignores_fenced_code_headings():
     text = ("# Real", "", "```", "# fake", "```", "", "| a |", "| --- |", "| 1 |", "")

@@ -11,8 +11,20 @@ from converter import (
     export_tables,
     load_tables,
     markdown_preview_text,
+    markdown_to_docx,
     markdown_to_pdf,
 )
+
+_MARKDOWN_SUFFIXES = {".md", ".markdown"}
+
+
+def _document_output_kind(out_fmt: str) -> str | None:
+    text = out_fmt.lower()
+    if text.startswith("pdf"):
+        return "pdf"
+    if text.startswith("word") or "docx" in text:
+        return "word"
+    return None
 
 ROOT = Path(__file__).resolve().parent
 SAMPLES = {
@@ -33,10 +45,13 @@ def cached_load(raw: bytes, suffix: str):
 
 @st.cache_data(show_spinner=False, max_entries=4, ttl=600)
 def cached_export(raw: bytes, suffix: str, out_fmt: str):
-    if out_fmt.lower().startswith("pdf") and suffix == ".docx":
+    document_kind = _document_output_kind(out_fmt)
+    if document_kind == "pdf" and suffix == ".docx":
         return docx_to_pdf(raw)
-    if out_fmt.lower().startswith("pdf") and suffix in {".md", ".markdown"}:
+    if suffix in _MARKDOWN_SUFFIXES and document_kind == "pdf":
         return markdown_to_pdf(raw)
+    if suffix in _MARKDOWN_SUFFIXES and document_kind == "word":
+        return markdown_to_docx(raw)
     tables, _warnings = cached_load(raw, suffix)
     return export_tables(tables, out_fmt)
 
@@ -108,7 +123,10 @@ for index, upload in enumerate(sources):
         continue
 
     raw = upload.getvalue() if hasattr(upload, "getvalue") else upload.read()
-    preview_document = out_fmt.lower().startswith("pdf") and suffix in {".docx", ".md", ".markdown"}
+    document_kind = _document_output_kind(out_fmt)
+    preview_document = (document_kind == "pdf" and suffix == ".docx") or (
+        document_kind is not None and suffix in _MARKDOWN_SUFFIXES
+    )
     if preview_document:
         tables, warnings = [], []
     else:
@@ -123,7 +141,8 @@ for index, upload in enumerate(sources):
 
     with st.expander(f"Preview — {upload.name}", expanded=True):
         if preview_document:
-            st.caption("Preview of the document that will be downloaded as a PDF.")
+            label = "PDF" if document_kind == "pdf" else "Word file"
+            st.caption(f"Preview of the document that will be downloaded as a {label}.")
             preview = cached_docx_preview(raw) if suffix == ".docx" else cached_markdown_preview(raw)
             st.text_area(
                 "Document",

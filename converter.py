@@ -608,6 +608,65 @@ def markdown_to_pdf(data: bytes) -> Export:
     return Export(data=_pdf_bytes(pdf), mime="application/pdf", extension="pdf")
 
 
+def markdown_to_docx(data: bytes) -> Export:
+    """Turn a Markdown document into a Word file of its headings, lists, text, and tables."""
+    from docx import Document
+
+    blocks = _markdown_document_blocks(data)
+    if not blocks:
+        raise ValueError("The Markdown file is empty.")
+    document = Document()
+    wrote = False
+    for kind, payload in blocks:
+        if kind == "table":
+            rows = [[_plain_markdown(cell) for cell in row] for row in payload]
+            if not rows or not rows[0]:
+                continue
+            width = len(rows[0])
+            word_table = document.add_table(rows=len(rows), cols=width)
+            for row_index, row in enumerate(rows):
+                for column_index, value in enumerate(_pad(row, width)):
+                    word_table.rows[row_index].cells[column_index].text = (
+                        "" if value is None else str(value)
+                    )
+            document.add_paragraph("")
+            wrote = True
+            continue
+        if kind == "code":
+            text = payload.rstrip()
+            if not text:
+                continue
+            document.add_paragraph(text)
+            wrote = True
+            continue
+        if kind == "rule":
+            document.add_paragraph("—" * 12)
+            continue
+        text = _plain_markdown(payload).strip()
+        if not text:
+            continue
+        if kind.startswith("heading"):
+            level = int(kind[-1]) if kind[-1].isdigit() else 1
+            document.add_heading(text, level=min(max(level, 1), 3))
+            wrote = True
+            continue
+        if kind == "list":
+            document.add_paragraph(text, style="List Bullet")
+            wrote = True
+            continue
+        document.add_paragraph(text)
+        wrote = True
+    if not wrote:
+        raise ValueError("The Markdown file has no text or tables to convert.")
+    buffer = io.BytesIO()
+    document.save(buffer)
+    return Export(
+        data=buffer.getvalue(),
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        extension="docx",
+    )
+
+
 def _markdown_document_blocks(data: bytes) -> list[tuple[str, str | list[list[str]]]]:
     lines = _decode_text(data).splitlines()
     blocks: list[tuple[str, str | list[list[str]]]] = []
